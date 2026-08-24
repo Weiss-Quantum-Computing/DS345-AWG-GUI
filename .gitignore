@@ -1,0 +1,15 @@
+# Saved instrument setups - these belong in the lab notebook, not in git
+ds345_setups/
+*.json
+*.txt
+*.csv
+*.npy
+
+# Uploaded-waveform cache - bench artefacts, remade by whoever uploads
+Waveforms/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
