@@ -28,7 +28,13 @@ be recalled later or kept with the data it produced.
   preview can always draw what the generator is playing.
 - **Preview** — what Apply would produce, including modulation, sweeps and
   bursts, with the pending record overlaid dashed and an aliasing warning
-  when the picture cannot be trusted.
+  when the picture cannot be trusted. Beside it, the limits the generator
+  would refuse: a frequency past the ceiling for that function (100 kHz on
+  triangle and ramp, 30.2 MHz on sine and square), an FM or sweep that
+  reaches past it, a sample clock over 40 MHz, and an amplitude and offset
+  that together need more than the ±5 V the output stage has. The DS345's
+  whole error channel is one bit in `*ESR`, so a refusal otherwise comes
+  back as "execution error" with no word on which setting caused it.
 
 ## The one big difference from the 4063B
 

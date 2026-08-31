@@ -1083,7 +1083,12 @@ def cache_forget(name):
     """Delete this app's copies of a waveform, and only this app's.
 
     The CSV is checked for the header before it goes, so Forget cannot take
-    out a file that merely shares the folder.
+    out a file that merely shares the folder. A .npy has no header to check -
+    it is read at all only because the 4063B tool once wrote them and its
+    Waveforms folder gets copied across - so it is opened instead, and only a
+    plain one-dimensional array of numbers is treated as ours. Anything else
+    under that name is somebody's data, and this is not the tool that deletes
+    it.
     """
     gone = False
     csv = cache_file(name)
@@ -1093,11 +1098,18 @@ def cache_forget(name):
             gone = True
         except OSError:
             pass
+    npy = cache_file(name, ".npy")
     try:
-        os.remove(cache_file(name, ".npy"))
-        gone = True
-    except OSError:
-        pass
+        data = np.load(npy, allow_pickle=False)
+        ours = data.ndim == 1 and data.dtype.kind in "fiu"
+    except Exception:
+        ours = False
+    if ours:
+        try:
+            os.remove(npy)
+            gone = True
+        except OSError:
+            pass
     return gone
 
 
@@ -1327,6 +1339,62 @@ def preview_aliasing(span, n, func, vals, mode="Off", mod=None, arb=None):
     return any(rate > 0 and n / (span * rate) < DENSITY_LIMITS.get(unit, 8.0)
                for rate, unit, _
                in preview_features(func, vals, mode, mod, arb))
+
+
+# The output stage's own ceiling: whichever way the two are split, the DS345
+# will not put out more than |Vpp/2| + |Vdc| = 5 V. It is the coupling that
+# makes apply_settings retry an amplitude once the offset it was fighting has
+# moved, and it is worth saying before Apply rather than after.
+LEVEL_MAX = 5.0
+
+
+def limit_warnings(func, vals, mode="Off", mod=None):
+    """The instrument's own limits this panel would cross, as short lines.
+
+    Worked out here rather than left to the generator because the DS345's
+    entire error channel is one bit in *ESR: a refused setting comes back as
+    "execution error", with no word on which setting it was or by how much.
+    The numbers are the specifications page's, so this is the panel saying
+    what the front panel would have said.
+
+    Pure, and about what Apply would send rather than about the picture - so
+    it is as true with the output trace switched off as with it on.
+    """
+    num, mnum = _numget(vals), _numget(mod or {})
+    out = []
+
+    ceiling = FREQ_MAX.get(func)
+    if ceiling:
+        freq = num("FREQ")
+        if freq > ceiling:
+            out.append(f"{_hz(freq)} is past the {func} ceiling of "
+                       f"{_hz(ceiling)}")
+        elif mode == "FM":
+            # A carrier inside the limit can still be swung out of it: FDEV
+            # is the whole span, so the top of the swing is half of it up.
+            top = freq + abs(mnum("FDEV")) / 2.0
+            if top > ceiling:
+                out.append(f"FM reaches {_hz(top)}, past the {func} ceiling "
+                           f"of {_hz(ceiling)}")
+        elif mode in ("Lin sweep", "Log sweep"):
+            top = max(mnum("STFR"), mnum("SPFR"))
+            if top > ceiling:
+                out.append(f"the sweep reaches {_hz(top)}, past the {func} "
+                           f"ceiling of {_hz(ceiling)}")
+
+    if func == "ARB":
+        rate = num("FSMP")
+        if rate > FSMP_MAX:
+            out.append(f"{_hz(rate)} is past the {_hz(FSMP_MAX)} sample clock")
+
+    # The amplitude and the offset are only ever refused as a pair, which is
+    # exactly why neither cell on its own can be checked against a number.
+    vpp = ampl_vpp(func, num("AMPL"), vals.get("AMPL_UNIT", "VP"))
+    reach = abs(vpp) / 2.0 + abs(num("OFFS"))
+    if reach > LEVEL_MAX + 1e-9:
+        out.append(f"{vpp:.4g} Vpp on {num('OFFS'):.4g} V of offset reaches "
+                   f"{reach:.4g} V; the DS345 allows {LEVEL_MAX:g}")
+    return out
 
 
 def idle_volts(func, vals, phase_deg, arb=None, invert=False):
@@ -1764,12 +1832,16 @@ class Ds345:
         4063B. If the function is already ARB the new record starts playing
         the moment the checksum lands.
         """
-        data = dac_samples(samples, normalize=normalize)
-        if data.size < MIN_ARB_POINTS:
+        # Length before height: normalising an all-zero record raises about
+        # the zeros, and on a record that is also the wrong length that is
+        # the less useful of the two things wrong with it.
+        n_in = np.asarray(samples).size
+        if n_in < MIN_ARB_POINTS:
             raise ValueError(f"need at least {MIN_ARB_POINTS} samples")
-        if data.size > MAX_ARB_POINTS:
-            raise ValueError(f"{data.size:,} samples will not fit - the "
+        if n_in > MAX_ARB_POINTS:
+            raise ValueError(f"{n_in:,} samples will not fit - the "
                              f"DS345 holds at most {MAX_ARB_POINTS:,} points")
+        data = dac_samples(samples, normalize=normalize)
         codes = np.round(data * DAC_FULL_SCALE).astype("<i2")
 
         reply = self.query(f"LDWF?0,{codes.size}")
@@ -1799,8 +1871,10 @@ class Ds345:
 def describe(snap):
     """Human-readable form of a snapshot, for the .txt written beside it."""
     s = snap.get("settings", {})
-    func = FUNCS[int(float(s.get("FUNC", "0") or 0))] \
-        if str(s.get("FUNC", "")).strip() else "?"
+    try:
+        func = FUNCS[int(float(str(s.get("FUNC", "")).strip()))]
+    except (ValueError, IndexError):
+        func = "?"          # a .txt is a courtesy; it must not fail the save
     mena = str(s.get("MENA", "")).strip()
     mode = (MODE_OF_MTYP.get(str(s.get("MTYP", "")).strip(), "?")
             if mena == "1" else "Off")
@@ -1816,6 +1890,11 @@ def describe(snap):
         f"offset             : {s.get('OFFS', '')} V",
         f"phase              : {s.get('PHSE', '')} deg",
         f"inverted           : {'yes' if str(s.get('INVT', '')).strip() == '1' else 'no'}",
+        # The one thing a snapshot can know about the arb slot. The DS345
+        # cannot read a waveform back, so this name - and the CSV in
+        # Waveforms/ that goes with it - is the whole record of what was
+        # playing when the setup was saved.
+        f"arb local name     : {snap.get('arb_local_name', '') or '(unknown)'}",
         "",
         f"modulation         : {mode}",
     ]
@@ -1884,12 +1963,20 @@ class App:
         self.loading = False          # panel being filled from the generator
         self.quiet = False            # a var write that is not a user edit
 
+        # The address the config file remembers, kept as its own field
+        # rather than read back out of saved_cfg: a connect that fails leaves
+        # awg.addr empty, and a config value that only lives in the snapshot
+        # of the last save would be erased by the next one.
+        self.remembered = ""
+
         self.setup_win = None
         self.outdir = tk.StringVar(value=os.path.join(
             os.path.expanduser("~"), "Desktop", "ds345_setups"))
         self.prefix = tk.StringVar(value="ds345")
         self.confirm_output = tk.BooleanVar(value=True)
         self.save_btn = self.recall_btn = self.mem_btn = None
+        self.connect_btn = None
+        self.mem_names = []           # list row -> waveform name, in order
 
         # The sequence lives on the app rather than in its window, so closing
         # the window and opening it again does not throw the sequence away.
@@ -1925,7 +2012,9 @@ class App:
         top.pack(fill="x", **pad)
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
-        ttk.Button(top, text="Connect", command=self.do_connect).pack(side="right")
+        self.connect_btn = ttk.Button(top, text="Connect",
+                                      command=self.do_connect)
+        self.connect_btn.pack(side="right")
         self.address = tk.StringVar()
         addr_box = ttk.Entry(top, textvariable=self.address, width=16)
         addr_box.pack(side="right", padx=(0, 4))
@@ -2926,11 +3015,15 @@ class App:
         self.show_pending = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text="pending", variable=self.show_pending,
                         command=self.draw_preview).pack(side="left", padx=(8, 0))
-        # Sits with the trace switches because that is what it is about: a
-        # caveat on the picture belongs beside the picture, where it can change
-        # on every keystroke without a log filling up behind it.
-        self.alias_note = ttk.Label(r, text="", foreground="#c60")
-        self.alias_note.pack(side="left", padx=(14, 4))
+        # Sits with the trace switches because that is where it can change on
+        # every keystroke without a log filling up behind it. Two kinds of
+        # warning share the line: a limit the generator will refuse, and a
+        # caveat on the drawing itself. The refusals go first - one of them
+        # means Apply will not do what the panel says, and the other only
+        # means the picture of it is coarse.
+        self.warn_note = ttk.Label(r, text="", foreground="#c60",
+                                   wraplength=520, justify="left")
+        self.warn_note.pack(side="left", padx=(14, 4))
 
     # -- helpers -----------------------------------------------------------
 
@@ -3304,10 +3397,13 @@ class App:
             if btn is not None and btn.winfo_exists():
                 btn.configure(state=state)
         self.out_btn.configure(state=state)
-        # Refresh reads the local Waveforms folder as well as the generator,
-        # and that half works with nothing attached.
-        if self.mem_btn is not None:
-            self.mem_btn.configure(state="disabled" if busy else "normal")
+        # These two are about the bus rather than about a connection: Refresh
+        # reads the local Waveforms folder, which works with nothing attached,
+        # and Connect is how a connection gets made in the first place. Both
+        # are live unless something is already talking to the instrument.
+        for btn in (self.mem_btn, self.connect_btn):
+            if btn is not None:
+                btn.configure(state="disabled" if busy else "normal")
         self.paint_output(self.out_btn, self.out_state)
         self.upload_btn.configure(
             state="normal" if live and self.arb_samples is not None
@@ -3572,8 +3668,16 @@ class App:
     # -- actions -----------------------------------------------------------
 
     def do_connect(self):
+        # A blank-address scan walks thirty primary addresses and takes about
+        # a minute, which is long enough that Connect gets pressed again. The
+        # second press used to start a second walk that closed the first
+        # one's VISA session out from under it.
+        if self.busy:
+            self.log("Already talking to the bus - wait for that to finish.")
+            return
         addr = self.address.get().strip()
-        remembered = (self.saved_cfg or {}).get("address", "")
+        remembered = self.remembered
+        self.set_busy(True)
 
         def work():
             try:
@@ -3587,6 +3691,7 @@ class App:
                     text=idn[:70], foreground="#060"))
                 self.log(f"Connected: {idn}")
                 self.log(f"Address:   {self.awg.addr}")
+                self.remembered = self.awg.addr
                 self.root.after(0, lambda: self.address.set(self.awg.addr))
                 state = self.awg.read_state()
                 self.root.after(0, lambda: self.after_read(state))
@@ -3729,6 +3834,11 @@ class App:
         if self.busy or not self.awg.inst:
             return
 
+        # *TRG is one exchange, but it is an exchange: without the flag it
+        # could go down the same VISA session an Apply was already halfway
+        # through, and the reply either command got would be the other's.
+        self.set_busy(True)
+
         def work():
             try:
                 missed = self.awg.trigger()
@@ -3739,6 +3849,8 @@ class App:
                     self.log("*TRG sent")
             except Exception as exc:
                 self.log(f"ERROR: {exc}")
+            finally:
+                self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
 
     def report_arb_timing(self):
@@ -3987,26 +4099,37 @@ class App:
         self.draw_preview()
 
     def refresh_memory(self):
-        """Show the local copies, and which of them the generator holds."""
+        """Show the local copies, and which of them the generator holds.
+
+        The names are kept in mem_names alongside the rows rather than read
+        back off them: a row is a name padded out to a column and then some
+        text, and picking the first word out of that is only the name again
+        while no name has a space in it. A file called "pi pulse 300ns.csv"
+        is a perfectly ordinary thing to find in Waveforms/, and it made both
+        Forget and Load to pending answer about a waveform called "pi".
+        """
         self.mem_list.delete(0, "end")
+        self.mem_names = []
         for name in sorted(self.known_waves):
             samples = self.known_waves[name]
             note = f"{samples.size:>9,} pts"
             if name == self.device_wave:
                 note += "   <- on the generator"
             self.mem_list.insert("end", f"{name:<18}{note}")
+            self.mem_names.append(name)
         if self.device_wave and self.device_wave not in self.known_waves:
             # The record the generator is playing has lost its local copy, so
             # nothing can draw it any more. Say so rather than showing an
             # empty list that implies the generator is empty too.
             self.mem_list.insert("end", f"{self.device_wave:<18} on the "
                                         "generator, no local copy")
+            self.mem_names.append(self.device_wave)
 
     def selected_wave(self):
         picked = self.mem_list.curselection()
-        if not picked:
+        if not picked or picked[0] >= len(self.mem_names):
             return None
-        return self.mem_list.get(picked[0]).split()[0]
+        return self.mem_names[picked[0]]
 
     def do_forget(self):
         """Drop this app's local copy. The generator keeps playing its own."""
@@ -4246,9 +4369,8 @@ class App:
 
         params = {}
         if mode != "Off":
-            for cmd, _ in [(c, None) for c in
-                           ("MDWF", "DPTH", "FDEV", "PDEV", "RATE", "BCNT",
-                            "STFR", "SPFR", "TSRC", "TRAT")]:
+            for cmd in ("MDWF", "DPTH", "FDEV", "PDEV", "RATE", "BCNT",
+                        "STFR", "SPFR", "TSRC", "TRAT"):
                 if val(cmd):
                     params[cmd] = val(cmd)
         plan["MODE"] = (mode, params)
@@ -4322,6 +4444,11 @@ class App:
             except ValueError:
                 pending = None
 
+        func = self.vars["FUNC"].get().strip().upper()
+        vals = self.panel_vals()
+        mode, mod = self.panel_mode()
+        limits = limit_warnings(func, vals, mode, mod)
+
         self.ax.clear()
         if not show_out and pending is None:
             self.ax.text(0.5, 0.5, "nothing selected\ntick output or pending",
@@ -4329,13 +4456,12 @@ class App:
                          transform=self.ax.transAxes, color="#666")
             self.ax.set_xticks([])
             self.ax.set_yticks([])
-            self.alias_note.configure(text="")
+            # Switching the trace off does not make a setting legal, so the
+            # limits stay up; only the caveat about the drawing goes.
+            self.warn_note.configure(text="; ".join(limits))
             self.canvas.draw_idle()
             return
 
-        func = self.vars["FUNC"].get().strip().upper()
-        vals = self.panel_vals()
-        mode, mod = self.panel_mode()
         arb = self.known_waves.get(self.device_wave) if func == "ARB" else None
 
         periods = []
@@ -4393,19 +4519,21 @@ class App:
                            fontsize=7, loc="upper right", framealpha=0.85)
         self.ax.set_title(" | ".join(notes) if notes else "",
                           fontsize=8, color="#666")
+        if pending is not None and self.pending_fsmp() > FSMP_MAX:
+            limits.append(f"the pending record's "
+                          f"{_hz(self.pending_fsmp())} is past the "
+                          f"{_hz(FSMP_MAX)} sample clock")
         if bad:
             named = bad[0] if len(bad) == 1 else " and ".join(bad)
-            self.alias_note.configure(text=f"{named} may be aliasing")
-        else:
-            self.alias_note.configure(text="")
+            limits.append(f"{named} may be aliasing")
+        self.warn_note.configure(text="; ".join(limits))
         self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
 
     def current_cfg(self):
         return {
-            "address": self.awg.addr or (self.saved_cfg or {}).get("address",
-                                                                   ""),
+            "address": self.awg.addr or self.remembered,
             "outdir": self.outdir.get(),
             "prefix": self.prefix.get(),
             "arb_name": self.arb_name.get(),
@@ -4451,6 +4579,15 @@ class App:
         restore = cfg.get("mute_restore")
         if isinstance(restore, list) and len(restore) == 3:
             self.mute_restore = tuple(str(v) for v in restore)
+        address = cfg.get("address")
+        if isinstance(address, str) and address.strip():
+            # The whole point of writing the address down. It is not put in
+            # the address box: a typed address is a deliberate override that
+            # is taken at its word without checking the reply is a DS345, and
+            # a remembered one should not arrive looking like one. It is tried
+            # first all the same, which is what makes the second and every
+            # later session connect in a moment instead of in a minute.
+            self.remembered = address.strip()
 
         self.saved_cfg = self.current_cfg()
         self.log(f"Restored last session from {CONFIG_PATH}")
