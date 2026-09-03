@@ -3823,14 +3823,10 @@ class App:
                 self.root.after(0, lambda: self.after_read(state))
                 self.root.after(0, self.save_config)
             except Exception as exc:
-                self.log(f"ERROR: {exc}")
-                # The release is scheduled first and on its own. It is what
-                # makes the panel usable again, and now that Connect takes the
-                # busy flag, anything that threw ahead of it would leave every
-                # button disabled with no way back short of restarting.
-                self.root.after(0, lambda: self.set_busy(False))
                 self.root.after(0, lambda: self.status.configure(
                     text="Not connected", foreground="#a00"))
+                self.log(f"ERROR: {exc}")
+                self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
 
     def after_read(self, raw, overwrite=False):
