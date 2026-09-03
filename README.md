@@ -36,6 +36,26 @@ be recalled later or kept with the data it produced.
   whole error channel is one bit in `*ESR`, so a refusal otherwise comes
   back as "execution error" with no word on which setting caused it.
 
+## Zoom and pan on the preview
+
+Matplotlib's own toolbar sits under the plot, the same one the ILC panel
+uses: drag a rectangle to zoom, pan, step back and forward through views,
+save the figure as a PNG. It earns its place on an arb in particular — a
+16,300-point record drawn across two repeats is a few pixels per sample, and
+zooming is the only way to see the shape of one edge.
+
+The preview redraws on every keystroke, so a zoom would otherwise last until
+the next character typed — and typing is exactly what you do while looking at
+a zoomed edge. It does not: a drag that ends in zoom or pan mode holds that
+view, and every redraw after it keeps the same window while the trace
+underneath changes. **Home** gives auto-scaling back. A plain click on the
+canvas freezes nothing.
+
+A held view is worth knowing about, because it looks exactly like a broken
+one — raise the amplitude with a zoom on and the trace simply leaves the
+window. So the toolbar row says `zoomed - Home to auto-scale` whenever the
+picture is not scaling itself.
+
 ## The one big difference from the 4063B
 
 The DS345 has **no output switch** - the BNC always drives what the settings

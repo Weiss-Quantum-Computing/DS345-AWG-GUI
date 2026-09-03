@@ -40,7 +40,8 @@ try:
     import matplotlib
     matplotlib.use("TkAgg")
     matplotlib.rcParams["font.size"] = 8
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
     from matplotlib.figure import Figure
 except ImportError:                       # everything but the preview still works
     Figure = None
@@ -727,7 +728,16 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
     `rate` is the sample clock the record is meant to be played at, in Sa/s -
     it is what turns a duration in seconds into a point count and a carrier in
     hertz into cycles across the segment, so a sequence is only true at the
-    rate it was built for. On the DS345 that clock is FSMP.
+    rate it was built for. On the DS345 that clock is FSMP, which only takes
+    exact divisors of 40 MHz - so the rate a sequence is built at is rarely
+    the round number that was typed, and the rounding below is the rule
+    rather than the exception here.
+
+    A segment is a whole number of samples, so what the record holds is
+    round(time x rate) / rate and not the time that was typed. That rounded
+    length is what every carrier and every phase reference below is worked
+    out from, and it is what the returned rows report - the typed time is a
+    request, and this is the record.
 
     `coherent` references every carrier to the start of the sequence rather
     than to its own segment, which is what makes the second pulse of a Ramsey
@@ -754,6 +764,14 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
             raise ValueError(
                 f"segment {index} ({shape}) comes to {n} point(s) at "
                 f"{rate:.10g} Sa/s - give it a longer time or a faster clock")
+        # The length the record actually has, which is not the length asked
+        # for. Carrying the typed time past this point puts freq x span
+        # cycles into a segment only n samples long, and references a
+        # coherent phase to a moment that is not in the record - so every
+        # boundary sits a little out, and the error accumulates down the
+        # sequence until a Ramsey pair arrives out of phase.
+        span_n = n / rate
+        gap_n = int(round(gap * rate))
         freq = _as_float(seg.get("freq"), 0.0)
         phase = _as_float(seg.get("phase"), 0.0)
         if coherent:
@@ -761,16 +779,15 @@ def build_sequence(segments, rate, unit="us", baseline=0.0, coherent=False,
             # been running since the sequence began.
             phase += 360.0 * freq * elapsed
         y = _segment_samples(shape, n, parse_kv(seg.get("extra")),
-                             freq * span, phase, waves)
+                             freq * span_n, phase, waves)
         pieces.append(np.asarray(y, dtype=np.float64) * _as_float(
             seg.get("ampl"), 1.0))
-        rows.append((index, shape, n, span, gap))
-        elapsed += span
+        rows.append((index, shape, n, span_n, gap_n / rate))
+        elapsed += span_n
 
-        gap_n = int(round(gap * rate))
         if gap_n > 0:
             pieces.append(np.full(gap_n, float(baseline)))
-        elapsed += gap
+        elapsed += gap_n / rate
 
     if not pieces:
         raise ValueError("no segments to build - add one first")
@@ -1113,6 +1130,20 @@ def cache_forget(name):
     return gone
 
 
+def sort_key(name):
+    """Group a name under its stem, with iterations in numeric order.
+
+    Plain alphabetical puts `_i10` before `_i2`, which is the wrong order for
+    the thing these names are actually counting. Splitting the trailing digits
+    out and sorting them as a number keeps a campaign's iterations together
+    and in sequence, which is the ordering a list of these is wanted in.
+    """
+    match = re.match(r"^(.*?)_?i(\d+)$", str(name))
+    if match and match.group(1):
+        return (match.group(1).lower(), 0, int(match.group(2)), "")
+    return (str(name).lower(), 1, 0, str(name))
+
+
 def safe_name(text):
     """Trim a typed name down to something legal in a filename."""
     out = "".join("_" if c in BAD_NAME_CHARS else c for c in text.strip())
@@ -1120,10 +1151,19 @@ def safe_name(text):
 
 
 def fmt_value(raw):
-    """Normalise an instrument reply into what the panel displays."""
+    """Normalise an instrument reply into what the panel displays.
+
+    Ten significant figures, not the six a bare %g gives. At six, a 10.000001
+    MHz carrier reads back as 1e+07, and an FSMP of 40 MHz / 13 - a perfectly
+    ordinary sample clock on this generator, since FSMP only takes exact
+    divisors - as 3.07692e+06. Nothing is ever sent wrong by that, since a
+    cell nobody typed in is not sent. But inst_vals keeps the same rounded
+    string, so the panel could sit a part in a million from the generator and
+    still say it was in sync, with no asterisk anywhere to say otherwise.
+    """
     raw = str(raw).strip()
     try:
-        return f"{float(raw):g}"
+        return f"{float(raw):.10g}"
     except ValueError:
         return raw
 
@@ -1516,8 +1556,11 @@ def preview_curve(func, vals, arb=None, periods=2.0, n=None, span=None,
         return t, ofst + vpp / 2.0 * (-y if invert else y), note
 
     # One phase accumulator for the lot: a plain carrier is the constant case,
-    # and FM and the sweeps are the same integral with f varying.
-    ph = np.cumsum(f_inst) * dt + ph_off
+    # and FM and the sweeps are the same integral with f varying. Summed from
+    # zero rather than with a plain cumsum, which counts the first sample's
+    # own step and so starts the trace one sample in - that is what drew a
+    # 0-phase 2 Vpp sine starting at a few mV instead of at 0 V.
+    ph = np.concatenate(([0.0], np.cumsum(f_inst[:-1]))) * dt + ph_off
     if bursting is not None:
         ph = np.where(bursting, burst_phase, rest_phase)
     y = _shape_out(func, ph, arb)
@@ -1952,6 +1995,7 @@ class App:
         self.halo_off = None          # whatever Tk's default frame colour is
         self.computed = set()         # keys this app worked out and filled in
         self.driver = {}              # linked group -> the cell now driving it
+        self.view_locked = False      # a zoom or pan is being held across redraws
         self.out_state = None         # LIVE / MUTED / DC / None
         self.mute_restore = None      # (ampl value, ampl unit, offset) to put back
 
@@ -3004,6 +3048,34 @@ class App:
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4,
                                          pady=4)
 
+        # Matplotlib's own toolbar, as in the ILC panel: zoom to a rectangle,
+        # pan, back/forward through views, and save the figure. Worth having
+        # here for the arb in particular - a 16,300-point record drawn across
+        # two repeats is a few pixels per sample, and the only way to see the
+        # shape of one edge is to zoom into it.
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", padx=4)
+        self.nav = NavigationToolbar2Tk(self.canvas, bar, pack_toolbar=False)
+        self.nav.update()
+        self.nav.pack(side="left")
+        # The preview redraws on every keystroke, so without this a zoom would
+        # survive until the next character typed - and typing is exactly what
+        # is done while looking at a zoomed edge. Any drag that ends while the
+        # toolbar is in zoom or pan mode locks the view, and it is held until
+        # Home.
+        self.canvas.mpl_connect("button_release_event", self._preview_dragged)
+        home = self._preview_home(self.nav.home)
+        self.nav.home = home
+        # And the button, which is the part that matters. The toolbar wires
+        # each button to the bound method it found at construction, so
+        # replacing the attribute alone leaves the button calling the
+        # original.
+        button = getattr(self.nav, "_buttons", {}).get("Home")
+        if button is not None:
+            button.configure(command=home)
+        self.view_note = ttk.Label(bar, text="", foreground="#06c")
+        self.view_note.pack(side="left", padx=(10, 0))
+
         r = ttk.Frame(f)
         r.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Label(r, text="Show:").pack(side="left")
@@ -3024,6 +3096,60 @@ class App:
         self.warn_note = ttk.Label(r, text="", foreground="#c60",
                                    wraplength=520, justify="left")
         self.warn_note.pack(side="left", padx=(14, 4))
+
+    def _preview_dragged(self, event):
+        """A zoom or pan has just finished, so hold that view.
+
+        Only while the toolbar is in one of those modes: a plain click on the
+        canvas is not a request to freeze anything.
+        """
+        if str(getattr(self.nav, "mode", "")):
+            self.view_locked = True
+            self.refresh_view_note()
+
+    def _preview_home(self, original):
+        """Home goes back to the automatic view, not just to the nav stack's.
+
+        The stack only holds views the toolbar itself produced. Every redraw
+        here is programmatic, so after Home the axes have to be rebuilt from
+        the panel rather than restored from a stack that never saw them.
+        """
+        def home(*args, **kwargs):
+            self.view_locked = False
+            try:
+                original(*args, **kwargs)
+            except Exception:
+                pass            # an empty nav stack is not a failure
+            self.draw_preview()
+        return home
+
+    def refresh_view_note(self):
+        """Say when the picture is not auto-scaling, because a frozen view is
+        indistinguishable from a broken one: raise the amplitude with a zoom
+        held and the trace simply leaves the window."""
+        note = getattr(self, "view_note", None)
+        if note is not None:
+            note.configure(text="zoomed - Home to auto-scale"
+                                if self.view_locked else "")
+
+    def remember_view(self):
+        """The limits the user is looking at, or None when auto-scaling.
+
+        Taken before the axis is cleared. One output means one axis that is
+        built once and only ever cleared, so unlike the 4063B's stacked
+        panels there is no layout for the remembered limits to stop
+        describing - they are always about the axis they came from.
+        """
+        if not self.view_locked or self.canvas is None:
+            return None
+        return (self.ax.get_xlim(), self.ax.get_ylim())
+
+    def restore_view(self, saved):
+        if not saved:
+            return
+        xlim, ylim = saved
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
 
     # -- helpers -----------------------------------------------------------
 
@@ -3697,10 +3823,14 @@ class App:
                 self.root.after(0, lambda: self.after_read(state))
                 self.root.after(0, self.save_config)
             except Exception as exc:
+                self.log(f"ERROR: {exc}")
+                # The release is scheduled first and on its own. It is what
+                # makes the panel usable again, and now that Connect takes the
+                # busy flag, anything that threw ahead of it would leave every
+                # button disabled with no way back short of restarting.
+                self.root.after(0, lambda: self.set_busy(False))
                 self.root.after(0, lambda: self.status.configure(
                     text="Not connected", foreground="#a00"))
-                self.log(f"ERROR: {exc}")
-                self.root.after(0, lambda: self.set_busy(False))
         threading.Thread(target=work, daemon=True).start()
 
     def after_read(self, raw, overwrite=False):
@@ -3902,7 +4032,23 @@ class App:
         """Adopt a set of samples, wherever they came from - a file, a built
         shape or pasted text. All three land here so they share the column
         picker, the preview and the upload button."""
-        self.arb_table = np.asarray(table, dtype=np.float64)
+        table = np.asarray(table, dtype=np.float64)
+        if table.shape[0] < 2:
+            # Two points is the least that is a waveform. Refused here rather
+            # than downstream, because an empty record takes min()/max() in
+            # pick_column and np.max() in do_upload with it - and under
+            # pythonw that failure is invisible, so the button simply does
+            # nothing.
+            self.log(f"  {source}: {table.shape[0]} sample(s) - not enough to "
+                     f"be a waveform, so nothing was loaded.")
+            messagebox.showerror(
+                "Not enough samples",
+                f"{source} has {table.shape[0]} sample(s).\n\n"
+                f"A waveform needs at least 2, and the DS345 wants at least "
+                f"{MIN_ARB_POINTS} to store one. The pending record has been "
+                f"left as it was.")
+            return
+        self.arb_table = table
         self.arb_source = source
         ncols = self.arb_table.shape[1]
         labels = [f"{i + 1}: {names[i]}" if names and i < len(names)
@@ -4110,7 +4256,7 @@ class App:
         """
         self.mem_list.delete(0, "end")
         self.mem_names = []
-        for name in sorted(self.known_waves):
+        for name in sorted(self.known_waves, key=sort_key):
             samples = self.known_waves[name]
             note = f"{samples.size:>9,} pts"
             if name == self.device_wave:
@@ -4432,6 +4578,7 @@ class App:
         """
         if self.canvas is None:
             return
+        saved = self.remember_view()
         show_out = self.show_out.get()
         pending = None
         if self.show_pending.get() and self.arb_samples is not None:
@@ -4459,6 +4606,9 @@ class App:
             # Switching the trace off does not make a setting legal, so the
             # limits stay up; only the caveat about the drawing goes.
             self.warn_note.configure(text="; ".join(limits))
+            # Not restore_view: there is nothing drawn to hold a view of, and
+            # the blank panel's own axes are what the message is centred on.
+            self.refresh_view_note()
             self.canvas.draw_idle()
             return
 
@@ -4527,6 +4677,8 @@ class App:
             named = bad[0] if len(bad) == 1 else " and ".join(bad)
             limits.append(f"{named} may be aliasing")
         self.warn_note.configure(text="; ".join(limits))
+        self.restore_view(saved)
+        self.refresh_view_note()
         self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
