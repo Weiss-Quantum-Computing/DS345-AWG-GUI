@@ -39,7 +39,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 try:
     import numpy as np
@@ -431,16 +431,31 @@ class PlotPanel(ttk.Frame):
 
     # -- view holding ------------------------------------------------------
 
+    def layout_key(self):
+        """What makes two figure layouts "the same" for holding a view:
+        the axes count, their subplot-grid cells and scales (positions
+        move with the layout engine, grid cells do not).  A twinned pair
+        and two stacked panels both have two axes but different keys."""
+        if self.fig is None:
+            return None
+        key = []
+        for ax in self.fig.axes:
+            ss = ax.get_subplotspec() if hasattr(ax, "get_subplotspec")                 else None
+            geo = tuple(ss.get_geometry()) if ss is not None else ("free",)
+            key.append(geo + (ax.get_xscale(), ax.get_yscale()))
+        return tuple(key)
+
     def _remember(self):
         if self.fig is None:
             return None
-        return [(ax.get_xlim(), ax.get_ylim()) for ax in self.fig.axes]
+        return (self.layout_key(),
+                [(ax.get_xlim(), ax.get_ylim()) for ax in self.fig.axes])
 
     def _restore(self, saved):
-        axes = self.fig.axes
-        if len(axes) != len(saved):
+        key, limits = saved
+        if key != self.layout_key():
             return False
-        for ax, (xl, yl) in zip(axes, saved):
+        for ax, (xl, yl) in zip(self.fig.axes, limits):
             ax.set_xlim(xl)
             ax.set_ylim(yl)
         return True
