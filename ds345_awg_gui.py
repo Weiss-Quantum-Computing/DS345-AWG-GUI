@@ -1450,6 +1450,10 @@ def idle_volts(func, vals, phase_deg, arb=None, invert=False):
     ofst = num("OFFS")
     if func == "NOISE":
         return ofst
+    # As in preview_curve: an arb rests at its first sample, because the
+    # DS345 will not take a phase for one.
+    if func == "ARB":
+        phase_deg = 0.0
     y = _shape_out(func, np.full(1, phase_deg / 360.0), arb)
     if y is None:
         return None
@@ -1486,7 +1490,11 @@ def preview_curve(func, vals, arb=None, periods=2.0, n=None, span=None,
     dt = t[1] - t[0] if n > 1 else 1.0
 
     f_inst = np.full(n, freq)                    # cycles per second
-    ph_off = np.full(n, num("PHSE") / 360.0)     # cycles
+    # An arb has no start phase to offset: PHSE is one of the settings the
+    # DS345 refuses under ARB, so apply_settings never sends it there and a
+    # record always begins at its first stored sample. Honouring a phase here
+    # would rotate the record into a shape the instrument cannot be put into.
+    ph_off = np.full(n, 0.0 if func == "ARB" else num("PHSE") / 360.0)
     scale = np.ones(n)                           # amplitude multiplier
     bursting = None                              # None unless a burst
     burst_phase = rest_phase = None
@@ -3507,10 +3515,22 @@ class App:
         return spec[slot][1] if slot < len(spec) else None
 
     def panel_vals(self):
-        """The output cells as one {key: string} for the preview helpers."""
-        return {key: self.vars[key].get().strip()
-                for key in ("FREQ", "AMPL", "AMPL_UNIT", "OFFS", "PHSE",
-                            "FSMP")}
+        """The output cells as one {key: string} for the preview helpers.
+
+        A greyed cell reads empty here, exactly as `collect` refuses to send
+        one. The preview's whole claim is that it shows what Apply would
+        produce, and a value the last function left behind is not part of
+        that - but it was still being drawn. A phase of 180 left in the box
+        by a square wave rotated an arb's preview by half its record, which
+        drew a triggered delayed pulse as high-then-low and had every reason
+        to look like the record was built wrong.
+        """
+        out = {}
+        for key in ("FREQ", "AMPL", "AMPL_UNIT", "OFFS", "PHSE", "FSMP"):
+            widget = self.widgets.get(key)
+            live = widget is None or str(widget.cget("state")) != "disabled"
+            out[key] = self.vars[key].get().strip() if live else ""
+        return out
 
     def set_busy(self, busy):
         self.busy = busy
