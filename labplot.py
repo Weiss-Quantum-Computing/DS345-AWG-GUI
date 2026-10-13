@@ -39,7 +39,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-__version__ = "1.0.1"
+__version__ = "1.0.3"
 
 try:
     import numpy as np
@@ -130,7 +130,7 @@ def ramp(n, cmap="viridis", lo=0.1, hi=0.85):
         return ["#1f77b4"] * n
     cm = matplotlib.colormaps[cmap]
     if n == 1:
-        return [mcolors.to_hex(cm(hi))]
+        return [mcolors.to_hex(cm(lo))]   # a lone run: the dark end reads
     return [mcolors.to_hex(cm(lo + (hi - lo) * i / (n - 1)))
             for i in range(n)]
 
@@ -191,8 +191,17 @@ def thin(x, y, max_pts=10000):
     if nb:
         core = y[:nb * blk].reshape(nb, blk)
         base = np.arange(nb) * blk
-        parts.append(core.argmin(axis=1) + base)
-        parts.append(core.argmax(axis=1) + base)
+        if np.issubdtype(core.dtype, np.floating) and np.isnan(core).any():
+            # NaN gaps: argmin/argmax would land on the NaN and hide the
+            # block; look past them (an all-NaN block keeps its first
+            # sample, so the gap still shows).
+            lo = np.where(np.isnan(core), np.inf, core).argmin(axis=1)
+            hi = np.where(np.isnan(core), -np.inf, core).argmax(axis=1)
+        else:
+            lo = core.argmin(axis=1)
+            hi = core.argmax(axis=1)
+        parts.append(lo + base)
+        parts.append(hi + base)
     idx = np.unique(np.concatenate(parts))
     return x[idx], y[idx], step
 
@@ -515,6 +524,8 @@ class PlotPanel(ttk.Frame):
     def _on_scroll(self, event):
         if not self.wheel_zoom or event.inaxes is None or event.xdata is None:
             return
+        if getattr(event.inaxes, "name", "") == "3d":
+            return                      # a 3-D view rotates; no wheel zoom
         self.zoom_at(event.inaxes, event.xdata, event.ydata,
                      1 / 1.25 if event.button == "up" else 1.25,
                      key=event.key or "")
