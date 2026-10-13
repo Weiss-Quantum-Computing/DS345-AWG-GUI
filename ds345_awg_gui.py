@@ -29,6 +29,7 @@ import os
 import queue
 import re
 import struct
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -39,12 +40,21 @@ import pyvisa
 try:
     import matplotlib
     matplotlib.use("TkAgg")
-    matplotlib.rcParams["font.size"] = 8
-    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
-                                                   NavigationToolbar2Tk)
-    from matplotlib.figure import Figure
 except ImportError:                       # everything but the preview still works
-    Figure = None
+    matplotlib = None
+
+# The preview is drawn on the lab's shared plot panel, labplot.py, vendored
+# beside this file. Other programs load this file by path, and
+# spec_from_file_location puts nothing on sys.path, so this folder goes on
+# the path by hand. labplot keeps matplotlib optional at import time, so
+# importing it drags nothing into a host that has no use for a figure.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import labplot
+except ImportError:                       # no panel; the preview says so
+    labplot = None
 
 # Where the generator was last found, so later sessions connect without the
 # minute-long walk of the whole bus. A typed address always wins over this.
@@ -60,8 +70,9 @@ CONFIG_PATH = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
 # the local list and the sequence builder can use it.
 WAVE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Waveforms")
 
-# One output, so one colour - the same blue CH1 wears in the sibling tools.
-OUT_COLOUR = "#1f77b4"
+# One output, so one colour - the same blue CH1 wears in the sibling tools
+# (labplot's CH1; the literal is that same hex, for when labplot is absent).
+OUT_COLOUR = labplot.CH_COLOURS[1] if labplot is not None else "#1f77b4"
 
 
 def _lighten(colour, amount):
@@ -72,8 +83,12 @@ def _lighten(colour, amount):
 
 
 # The pending trace is aimed at the output, but not on it yet: a paler shade
-# of the output's colour says both at once.
-PENDING_COLOUR = _lighten(OUT_COLOUR, 0.42)
+# of the output's colour says both at once. labplot's "pending" shade is the
+# same mix; _lighten stays for the output button, and for when labplot or
+# matplotlib is absent.
+PENDING_COLOUR = (labplot.lighten(OUT_COLOUR, 0.42)
+                  if labplot is not None and labplot.HAVE_MPL
+                  else _lighten(OUT_COLOUR, 0.42))
 
 # The output button, coloured by what the BNC is actually doing. Red is
 # driving. There is no OFF on this instrument, so the green state is MUTED -
@@ -1975,6 +1990,8 @@ def describe(snap):
 class App:
     def __init__(self, root):
         self.root = root
+        if labplot is not None:
+            labplot.apply_style()     # the lab's figure style, once
         self.awg = Ds345()
         self.msgs = queue.Queue()
         self.busy = False
@@ -2003,7 +2020,9 @@ class App:
         self.halo_off = None          # whatever Tk's default frame colour is
         self.computed = set()         # keys this app worked out and filled in
         self.driver = {}              # linked group -> the cell now driving it
-        self.view_locked = False      # a zoom or pan is being held across redraws
+        self.preview = None           # the shared plot panel, once built
+        self.show_out = tk.BooleanVar(value=True)
+        self.show_pending = tk.BooleanVar(value=True)
         self.out_state = None         # LIVE / MUTED / DC / None
         self.mute_restore = None      # (ampl value, ampl unit, offset) to put back
 
@@ -2064,6 +2083,10 @@ class App:
         top.pack(fill="x", **pad)
         self.status = ttk.Label(top, text="Not connected", foreground="#a00")
         self.status.pack(side="left")
+        # Beside Connect, where the 4063B panel keeps it:
+        # status | Connect | Load/save setups...
+        ttk.Button(top, text="Load/save setups...",
+                   command=self.do_setups).pack(side="right", padx=(6, 0))
         self.connect_btn = ttk.Button(top, text="Connect",
                                       command=self.do_connect)
         self.connect_btn.pack(side="right")
@@ -2098,10 +2121,6 @@ class App:
         self.sync = ttk.Label(bar, text="not read yet", foreground="#666")
         self.sync.pack(side="left", padx=6)
 
-        bar2 = ttk.Frame(left)
-        bar2.pack(fill="x", padx=8)
-        ttk.Button(bar2, text="Load/save setups...",
-                   command=self.do_setups).pack(side="left")
         hint = ttk.Frame(left)
         hint.pack(fill="x", padx=8, pady=(6, 0))
         tk.Label(hint, text="   ", bg=COMPUTED_BG, relief="solid",
@@ -2139,7 +2158,7 @@ class App:
         self.load_config()
         self.refresh_memory()
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
 
     # -- panel construction ------------------------------------------------
 
@@ -3044,120 +3063,54 @@ class App:
     def build_preview(self, parent, pad):
         f = ttk.LabelFrame(parent, text="Preview (what Apply would produce)")
         f.pack(fill="x", **pad)
-        if Figure is None:
-            ttk.Label(f, text="matplotlib not installed - no preview",
+        if labplot is None:
+            ttk.Label(f, text="labplot.py missing beside ds345_awg_gui.py",
                       foreground="#666").pack(padx=8, pady=8)
-            self.canvas = None
             return
-        self.fig = Figure(figsize=(5.6, 3.0), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.fig.subplots_adjust(left=0.14, right=0.96, top=0.90, bottom=0.18)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=f)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=4,
-                                         pady=4)
+        # The lab's shared panel: matplotlib's own toolbar (zoom to a
+        # rectangle, pan, back and forward through views, save the figure),
+        # wheel zoom about the cursor, right-click copying the cursor
+        # position, and the view held across redraws once zoomed or panned.
+        # The hold matters here because this preview redraws on every
+        # keystroke, and typing is exactly what is done while looking at a
+        # zoomed edge - without it a zoom would last until the next character
+        # typed. Zooming earns its place on an arb in particular: a
+        # 16,300-point record drawn across two repeats is a few pixels per
+        # sample, and it is the only way to see the shape of one edge.
+        # Without matplotlib the panel is a label that says so.
+        self.preview = labplot.PlotPanel(
+            f, draw=self.draw_preview, figsize=(5.6, 3.0),
+            save_name=lambda: "ds345_preview",
+            save_dir=lambda: self.outdir.get(),
+            on_status=self.log)
+        self.preview.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # Matplotlib's own toolbar, as in the ILC panel: zoom to a rectangle,
-        # pan, back/forward through views, and save the figure. Worth having
-        # here for the arb in particular - a 16,300-point record drawn across
-        # two repeats is a few pixels per sample, and the only way to see the
-        # shape of one edge is to zoom into it.
-        bar = ttk.Frame(f)
-        bar.pack(fill="x", padx=4)
-        self.nav = NavigationToolbar2Tk(self.canvas, bar, pack_toolbar=False)
-        self.nav.update()
-        self.nav.pack(side="left")
-        # The preview redraws on every keystroke, so without this a zoom would
-        # survive until the next character typed - and typing is exactly what
-        # is done while looking at a zoomed edge. Any drag that ends while the
-        # toolbar is in zoom or pan mode locks the view, and it is held until
-        # Home.
-        self.canvas.mpl_connect("button_release_event", self._preview_dragged)
-        home = self._preview_home(self.nav.home)
-        self.nav.home = home
-        # And the button, which is the part that matters. The toolbar wires
-        # each button to the bound method it found at construction, so
-        # replacing the attribute alone leaves the button calling the
-        # original.
-        button = getattr(self.nav, "_buttons", {}).get("Home")
-        if button is not None:
-            button.configure(command=home)
-        self.view_note = ttk.Label(bar, text="", foreground="#06c")
-        self.view_note.pack(side="left", padx=(10, 0))
-
-        r = ttk.Frame(f)
-        r.pack(fill="x", padx=6, pady=(0, 6))
+        # The trace switches live in the panel's own row above the figure:
+        # controls above, toolbar below, as in the sibling tools.
+        r = self.preview.controls
         ttk.Label(r, text="Show:").pack(side="left")
-        self.show_out = tk.BooleanVar(value=True)
         tk.Checkbutton(r, text="output", variable=self.show_out,
-                       command=self.draw_preview, foreground=OUT_COLOUR,
+                       command=self.redraw_preview, foreground=OUT_COLOUR,
                        activeforeground=OUT_COLOUR,
                        selectcolor="white").pack(side="left", padx=(4, 0))
-        self.show_pending = tk.BooleanVar(value=True)
         ttk.Checkbutton(r, text="pending", variable=self.show_pending,
-                        command=self.draw_preview).pack(side="left", padx=(8, 0))
+                        command=self.redraw_preview).pack(side="left",
+                                                          padx=(8, 0))
         # Sits with the trace switches because that is where it can change on
         # every keystroke without a log filling up behind it. Two kinds of
         # warning share the line: a limit the generator will refuse, and a
         # caveat on the drawing itself. The refusals go first - one of them
         # means Apply will not do what the panel says, and the other only
         # means the picture of it is coarse.
-        self.warn_note = ttk.Label(r, text="", foreground="#c60",
+        self.warn_note = ttk.Label(r, text="", foreground=labplot.WARN_COLOUR,
                                    wraplength=520, justify="left")
         self.warn_note.pack(side="left", padx=(14, 4))
 
-    def _preview_dragged(self, event):
-        """A zoom or pan has just finished, so hold that view.
-
-        Only while the toolbar is in one of those modes: a plain click on the
-        canvas is not a request to freeze anything.
-        """
-        if str(getattr(self.nav, "mode", "")):
-            self.view_locked = True
-            self.refresh_view_note()
-
-    def _preview_home(self, original):
-        """Home goes back to the automatic view, not just to the nav stack's.
-
-        The stack only holds views the toolbar itself produced. Every redraw
-        here is programmatic, so after Home the axes have to be rebuilt from
-        the panel rather than restored from a stack that never saw them.
-        """
-        def home(*args, **kwargs):
-            self.view_locked = False
-            try:
-                original(*args, **kwargs)
-            except Exception:
-                pass            # an empty nav stack is not a failure
-            self.draw_preview()
-        return home
-
-    def refresh_view_note(self):
-        """Say when the picture is not auto-scaling, because a frozen view is
-        indistinguishable from a broken one: raise the amplitude with a zoom
-        held and the trace simply leaves the window."""
-        note = getattr(self, "view_note", None)
-        if note is not None:
-            note.configure(text="zoomed - Home to auto-scale"
-                                if self.view_locked else "")
-
-    def remember_view(self):
-        """The limits the user is looking at, or None when auto-scaling.
-
-        Taken before the axis is cleared. One output means one axis that is
-        built once and only ever cleared, so unlike the 4063B's stacked
-        panels there is no layout for the remembered limits to stop
-        describing - they are always about the axis they came from.
-        """
-        if not self.view_locked or self.canvas is None:
-            return None
-        return (self.ax.get_xlim(), self.ax.get_ylim())
-
-    def restore_view(self, saved):
-        if not saved:
-            return
-        xlim, ylim = saved
-        self.ax.set_xlim(xlim)
-        self.ax.set_ylim(ylim)
+    def redraw_preview(self):
+        """Draw the preview through the shared panel, which keeps a zoomed
+        or panned view across the redraw. No panel, nothing to draw on."""
+        if self.preview is not None:
+            self.preview.draw()
 
     # -- helpers -----------------------------------------------------------
 
@@ -3198,7 +3151,7 @@ class App:
                 self.recompute()
         self.show_burst_idle()
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
 
     def edited(self, key):
         """True if the panel value differs from what the generator last said."""
@@ -3856,7 +3809,7 @@ class App:
         self.set_busy(False)
         self.refresh_marks()
         self.refresh_memory()
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_discard(self):
         """Put every cell back to what the generator last reported.
@@ -3891,7 +3844,7 @@ class App:
         finally:
             self.loading = False
         self.refresh_marks()
-        self.draw_preview()
+        self.redraw_preview()
         self.log(f"Discarded {len(pending)} unapplied change(s).")
 
     def do_read(self):
@@ -4076,8 +4029,7 @@ class App:
         if ncols > 1:
             self.log(f"  {self.arb_table.shape[0]} rows x {ncols} columns"
                      + (f": {', '.join(names)}" if names else ""))
-        if self.canvas is not None:
-            self.show_pending.set(True)        # show what is about to go up
+        self.show_pending.set(True)            # show what is about to go up
         self.pick_column()
 
     def pick_column(self):
@@ -4096,12 +4048,12 @@ class App:
         self.log(f"  using column {index + 1}: {data.size} pts, "
                  f"{data.min():g} to {data.max():g}")
         self.set_busy(self.busy)
-        self.draw_preview()
+        self.redraw_preview()
 
     def on_norm(self):
         """The normalise switch changes what will be sent, so say so at once."""
         self.show_arb_info()
-        self.draw_preview()
+        self.redraw_preview()
 
     def show_arb_info(self):
         """The line beside Load file..., including the warnings that matter
@@ -4151,7 +4103,7 @@ class App:
         self.show_arb_info()
         self.log(f"Pending waveform cleared ({was}). Nothing was sent.")
         self.set_busy(self.busy)
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_upload(self):
         if self.busy or not self.awg.inst or self.arb_samples is None:
@@ -4258,7 +4210,7 @@ class App:
             self.log(f"Local copies unchanged ({len(self.known_waves)} in "
                      f"{WAVE_CACHE}).")
         self.refresh_memory()
-        self.draw_preview()
+        self.redraw_preview()
 
     def refresh_memory(self):
         """Show the local copies, and which of them the generator holds.
@@ -4315,7 +4267,7 @@ class App:
         cache_forget(name)
         self.log(f"Forgot the local copy of '{name}'")
         self.refresh_memory()
-        self.draw_preview()
+        self.redraw_preview()
 
     def do_use_wave(self):
         """Load the selected waveform's local copy into the pending slot.
@@ -4584,17 +4536,18 @@ class App:
             rate = _as_float(self.build_rate.get(), 0.0)
         return rate
 
-    def draw_preview(self):
+    def draw_preview(self, fig):
         """The output's trace, and the pending record as it would play.
 
         The pending waveform is drawn as ARB at the panel's sample clock,
         dashed and in a paler shade - one instrument, one axis, so the two
         traces share time and the picture says whether the pending record is
         longer or shorter than what is playing now.
+
+        Called by the shared panel with its figure, through redraw_preview.
+        The panel holds a zoomed view across the call and repaints after it,
+        so this only builds the axes; it never touches the canvas.
         """
-        if self.canvas is None:
-            return
-        saved = self.remember_view()
         show_out = self.show_out.get()
         pending = None
         if self.show_pending.get() and self.arb_samples is not None:
@@ -4612,21 +4565,16 @@ class App:
         mode, mod = self.panel_mode()
         limits = limit_warnings(func, vals, mode, mod)
 
-        self.ax.clear()
         if not show_out and pending is None:
-            self.ax.text(0.5, 0.5, "nothing selected\ntick output or pending",
-                         ha="center", va="center",
-                         transform=self.ax.transAxes, color="#666")
-            self.ax.set_xticks([])
-            self.ax.set_yticks([])
+            # No axes at all, so a held view has nothing to describe and the
+            # panel releases it; the message is centred on the bare figure.
+            labplot.placeholder(fig, "nothing selected - tick output or pending")
             # Switching the trace off does not make a setting legal, so the
             # limits stay up; only the caveat about the drawing goes.
             self.warn_note.configure(text="; ".join(limits))
-            # Not restore_view: there is nothing drawn to hold a view of, and
-            # the blank panel's own axes are what the message is centred on.
-            self.refresh_view_note()
-            self.canvas.draw_idle()
             return
+        fig.clear()
+        ax = fig.add_subplot(111)
 
         arb = self.known_waves.get(self.device_wave) if func == "ARB" else None
 
@@ -4654,8 +4602,8 @@ class App:
                 notes.append(label)
             else:
                 t, v = curve
-                handles += self.ax.plot(t * 1e3, v, lw=1.1, color=OUT_COLOUR,
-                                        label=label)
+                handles += ax.plot(t * 1e3, v, lw=1.1, color=OUT_COLOUR,
+                                   label=label)
                 n = preview_points(span, func, vals, mode, mod, arb)
                 if preview_aliasing(span, n, func, vals, mode, mod, arb):
                     bad.append("output")
@@ -4668,7 +4616,7 @@ class App:
                 t, v = curve[:2]
                 rate = self.pending_fsmp()
                 at = f" at {_hz(rate)}" if rate > 0 else ""
-                handles += self.ax.plot(
+                handles += ax.plot(
                     t * 1e3, v, lw=1.4, ls="--", color=PENDING_COLOUR,
                     label=f"pending ({pending.size} pts{at})")
                 n = preview_points(span, "ARB", pending_vals, mode, mod,
@@ -4677,14 +4625,12 @@ class App:
                                     pending):
                     bad.append("pending")
 
-        self.ax.set_xlabel("time (ms)")
-        self.ax.set_ylabel("volts")
-        self.ax.grid(alpha=0.3)
+        labplot.finish(ax, "time (ms)", "volts")
         if handles:
-            self.ax.legend(handles, [h.get_label() for h in handles],
-                           fontsize=7, loc="upper right", framealpha=0.85)
-        self.ax.set_title(" | ".join(notes) if notes else "",
-                          fontsize=8, color="#666")
+            labplot.legend(ax, loc="upper right")
+        # What could not be drawn, as a plain statement - never a verdict.
+        ax.set_title(" | ".join(notes) if notes else "",
+                     fontsize=labplot.FONT_SIZE, color="#666")
         if pending is not None and self.pending_fsmp() > FSMP_MAX:
             limits.append(f"the pending record's "
                           f"{_hz(self.pending_fsmp())} is past the "
@@ -4693,9 +4639,6 @@ class App:
             named = bad[0] if len(bad) == 1 else " and ".join(bad)
             limits.append(f"{named} may be aliasing")
         self.warn_note.configure(text="; ".join(limits))
-        self.restore_view(saved)
-        self.refresh_view_note()
-        self.canvas.draw_idle()
 
     # -- config ------------------------------------------------------------
 

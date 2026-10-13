@@ -38,23 +38,22 @@ be recalled later or kept with the data it produced.
 
 ## Zoom and pan on the preview
 
-Matplotlib's own toolbar sits under the plot, the same one the ILC panel
-uses: drag a rectangle to zoom, pan, step back and forward through views,
-save the figure as a PNG. It earns its place on an arb in particular — a
-16,300-point record drawn across two repeats is a few pixels per sample, and
-zooming is the only way to see the shape of one edge.
+The preview uses the lab's shared plot panel (labplot.py, vendored from
+Weiss-Quantum-Computing/lab-plot). Toolbar: Home, Back, Forward, Pan, Zoom,
+Save. Once you zoom or pan (toolbar or mouse wheel) the view is held across
+redraws and a blue note says 'zoomed - Home to auto-scale'; Home releases it.
+The mouse wheel zooms about the cursor (Shift keeps the x range, Ctrl keeps
+the y range) and each step goes on the Back stack. Right-click copies the
+cursor position as x<TAB>y to the clipboard. Save proposes a name and the
+output folder and writes PNG at 150 dpi.
 
-The preview redraws on every keystroke, so a zoom would otherwise last until
-the next character typed — and typing is exactly what you do while looking at
-a zoomed edge. It does not: a drag that ends in zoom or pan mode holds that
-view, and every redraw after it keeps the same window while the trace
-underneath changes. **Home** gives auto-scaling back. A plain click on the
-canvas freezes nothing.
-
-A held view is worth knowing about, because it looks exactly like a broken
-one — raise the amplitude with a zoom on and the trace simply leaves the
-window. So the toolbar row says `zoomed - Home to auto-scale` whenever the
-picture is not scaling itself.
+Zooming earns its place on an arb in particular — a 16,300-point record drawn
+across two repeats is a few pixels per sample, and it is the only way to see
+the shape of one edge. The held view matters here because the preview redraws
+on every keystroke, and typing is exactly what you do while looking at a
+zoomed edge; without it a zoom would last until the next character typed. A
+held view looks exactly like a broken one — raise the amplitude with a zoom
+on and the trace simply leaves the window — which is what the note is for.
 
 ## The one big difference from the 4063B
 
@@ -72,6 +71,8 @@ pip install pyvisa numpy matplotlib
 ```
 
 matplotlib only draws the preview - everything else works without it.
+`labplot.py` (the vendored copy of the shared plot panel) stays beside
+`ds345_awg_gui.py`; without it the preview says so and the rest still works.
 
 Run with `pythonw ds345_awg_gui.py` (no console window).
 
