@@ -83,6 +83,11 @@ scan of a quiet bus takes about a minute, and the found address is
 remembered in `%APPDATA%\DS345-AWG-GUI\config.json` so later sessions
 connect instantly. Or type the address (e.g. `GPIB0::19::INSTR`) directly.
 
+The scan never probes `GPIB0::10::INSTR` (the SR760, which Spectrum Grab or
+EOM-ILC may be mid-transfer with; `OTHER_INSTRUMENTS` in the code). A typed
+address has to answer `*IDN?` as a DS345; if something else answers, the panel
+says what and asks before connecting to it anyway.
+
 If nothing is found: check the DS345 is powered on, and on its front panel
 that GPIB is enabled with a free address (SHIFT then GPIB shows it - the
 SR760 on this bench already holds address 10).

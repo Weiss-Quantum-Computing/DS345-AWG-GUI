@@ -124,6 +124,7 @@ def fresh_bus():
 
 
 gui.pyvisa.ResourceManager = FakeRM
+REAL_CONNECT = gui.App.do_connect
 
 
 def connected_ds345():
@@ -152,6 +153,33 @@ def library_checks():
        "upload_arb refuses it before LDWF?, sending nothing")
     ok(dev.upload_arb(np.nan_to_num(gap, posinf=0.0)) == 64
        and len(dev.inst.raw) == 1, "the same record without the gap uploads")
+
+    # DS-3: a typed address must answer as a DS345; a scan skips the SR760.
+    devs = fresh_bus()
+    sr = devs["GPIB0::10::INSTR"]
+    d = gui.Ds345()
+    err = raises(gui.NotADs345, d.connect, "GPIB0::10::INSTR")
+    ok(err and "SR760" in err and d.inst is None
+       and sr.writes == [] and sr.queries == ["*IDN?"],
+       "typed SR760 address is refused; it got *IDN? and nothing else")
+    ok(d.connect("GPIB0::10::INSTR", accept_any=True) == SR760_IDN
+       and d.addr == "GPIB0::10::INSTR",
+       "accept_any=True (asked first, in the panel) connects anyway")
+    d.close()
+    fresh_bus()
+    d = gui.Ds345()
+    logged = []
+    ok("DS345" in d.connect(None, None, log=logged.append)
+       and d.addr == "GPIB0::19::INSTR",
+       "blank-address scan finds the DS345 at 19")
+    ok(("GPIB0::10::INSTR", "open") not in FakeRM.bus
+       and any("not probing GPIB0::10::INSTR" in s for s in logged),
+       "... without opening the SR760's address, and says so")
+    fresh_bus()
+    d = gui.Ds345()
+    d.connect(None, "GPIB0::10::INSTR")
+    ok(("GPIB0::10::INSTR", "open") not in FakeRM.bus,
+       "a remembered SR760 address is not probed by a scan either")
 
 
 # ---------------------------------------------------------------- GUI checks
@@ -265,6 +293,26 @@ def gui_checks():
     ok(len(dlg.calls) == 1 and app.arb_index == 1
        and np.all(np.isfinite(app.arb_samples)),
        "picking the inf column is refused and column 2 kept")
+
+    # DS-3 in the panel: a typed non-DS345 address asks before connecting.
+    app.awg.close()
+    app.awg = gui.Ds345()
+    gui.App.do_connect = REAL_CONNECT   # the retry calls self.do_connect
+    fresh_bus()
+    app.address.set("GPIB0::10::INSTR")
+    dlg.expect(False)
+    REAL_CONNECT(app)
+    root.update()
+    ok(len(dlg.calls) == 1 and dlg.calls[0][0] == "askyesno"
+       and "SR760" in dlg.calls[0][2] and app.awg.inst is None
+       and not app.busy,
+       "typed SR760 address: the panel asks, and No leaves it unconnected")
+    dlg.expect(True)
+    REAL_CONNECT(app)
+    root.update()
+    root.update()                   # the retry's own callbacks
+    ok(app.awg.addr == "GPIB0::10::INSTR" and app.awg.inst is not None,
+       "Yes connects to it anyway")
 
     root.update()
     root.destroy()

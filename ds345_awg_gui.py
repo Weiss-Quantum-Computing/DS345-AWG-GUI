@@ -1650,6 +1650,22 @@ READ_QUERIES = [
 ]
 
 
+# Addresses a blank-address scan never probes: another instrument on this bus
+# that a sibling program (Spectrum Grab, EOM-ILC) may be mid-transfer with,
+# where an injected *IDN? can steal or interleave a reply. A typed address is
+# still tried as typed, and then has to identify as a DS345.
+OTHER_INSTRUMENTS = {"GPIB0::10::INSTR": "the SR760 spectrum analyser"}
+
+
+class NotADs345(RuntimeError):
+    """A typed address answered *IDN?, but not as a DS345."""
+
+    def __init__(self, addr, idn):
+        self.addr, self.idn = addr, idn
+        super().__init__(f"{addr} answers *IDN? as {idn!r} - not a DS345. "
+                         f"Nothing else was sent to it.")
+
+
 class Ds345:
     """The DS345 over GPIB. One VISA session, so every exchange the GUI makes
     is serialised through the worker thread."""
@@ -1660,11 +1676,17 @@ class Ds345:
         self.idn = ""
         self.addr = ""
 
-    def connect(self, addr=None, remembered=None, log=lambda s: None):
+    def connect(self, addr=None, remembered=None, log=lambda s: None,
+                accept_any=False, skip=None):
         """Find the generator and open it.
 
-        A typed address is tried alone and taken at its word if something
-        answers *IDN?. Otherwise: the address that worked last time, then
+        A typed address is tried alone, and has to answer *IDN? as a DS345:
+        anything else raises NotADs345 (taken at its word, a typed SR760
+        address had Apply send FUNC/AMPL/OFFS/MENA to the spectrum analyser),
+        unless accept_any is set - the panel sets it only after asking.
+
+        A blank address never probes `skip` (default: OTHER_INSTRUMENTS, the
+        SR760's address). Otherwise it tries the address that worked last time, then
         whatever GPIB resources VISA already lists, then the whole primary
         address range - because an instrument that has never been opened by
         NI MAX does not show up in list_resources at all, and the DS345 on
@@ -1683,6 +1705,12 @@ class Ds345:
             candidates += [r for r in listed if r not in candidates]
             candidates += [f"GPIB0::{n}::INSTR" for n in range(1, 31)
                            if f"GPIB0::{n}::INSTR" not in candidates]
+            avoid = ({k.upper(): v for k, v in OTHER_INSTRUMENTS.items()}
+                     if skip is None else {s.upper(): "excluded" for s in skip})
+            for r in candidates:
+                if r.upper() in avoid:
+                    log(f"  not probing {r}: {avoid[r.upper()]}")
+            candidates = [r for r in candidates if r.upper() not in avoid]
         problems = []
         for res in candidates:
             dev = None
@@ -1702,8 +1730,16 @@ class Ds345:
                     except Exception:
                         pass
                 continue
-            # A typed address is taken at its word; a scan only claims a DS345.
-            if addr or "DS345" in idn.upper():
+            # Only a DS345 is claimed - typed or scanned - unless the caller
+            # has asked and been told what answered instead.
+            if addr and not accept_any and "DS345" not in idn.upper():
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                self.close()
+                raise NotADs345(res, idn)
+            if (addr and accept_any) or "DS345" in idn.upper():
                 dev.timeout = 8000
                 self.inst, self.idn, self.addr = dev, idn, res
                 # Clear a stale event register so the first Apply's error
@@ -3788,7 +3824,7 @@ class App:
 
     # -- actions -----------------------------------------------------------
 
-    def do_connect(self):
+    def do_connect(self, accept_any=False):
         # A blank-address scan walks thirty primary addresses and takes about
         # a minute, which is long enough that Connect gets pressed again. The
         # second press used to start a second walk that closed the first
@@ -3800,14 +3836,33 @@ class App:
         remembered = self.remembered
         self.set_busy(True)
 
+        def not_a_ds345(exc):
+            """Main thread: a typed address answered as something else."""
+            self.set_busy(False)
+            if messagebox.askyesno(
+                    "Not a DS345",
+                    f"{exc.addr} answers as:\n\n    {exc.idn}\n\n"
+                    "That is not a DS345. Connected anyway, Read and Apply "
+                    "would send DS345 commands (FUNC, AMPL, OFFS, MENA...) "
+                    "to that instrument.\n\nConnect to it as the DS345 anyway?",
+                    icon="warning", default="no"):
+                self.do_connect(accept_any=True)
+
         def work():
             try:
                 if not addr:
                     self.log("Looking for the DS345 (typed address is blank, "
                              "so scanning GPIB - the first scan of a quiet "
                              "bus takes a minute)...")
-                idn = self.awg.connect(addr or None, remembered or None,
-                                       log=self.log)
+                try:
+                    idn = self.awg.connect(addr or None, remembered or None,
+                                           log=self.log, accept_any=accept_any)
+                except NotADs345 as exc:
+                    self.log(f"ERROR: {exc}")
+                    self.root.after(0, lambda: self.status.configure(
+                        text="Not connected", foreground="#a00"))
+                    self.root.after(0, lambda e=exc: not_a_ds345(e))
+                    return
                 self.root.after(0, lambda: self.status.configure(
                     text=idn[:70], foreground="#060"))
                 self.log(f"Connected: {idn}")
