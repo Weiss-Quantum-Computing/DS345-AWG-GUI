@@ -139,6 +139,20 @@ def library_checks():
     dev = connected_ds345()
     ok(dev.addr == "GPIB0::19::INSTR", "fake DS345 connects at a typed address")
 
+    # DS-2: NaN/inf is refused before LDWF, not uploaded as a zero record.
+    gap = np.sin(np.linspace(0, 6, 64))
+    gap[[5, 9]] = [np.nan, np.inf]
+    for norm in (True, False):
+        ok(raises(ValueError, gui.dac_samples, gap, normalize=norm),
+           f"dac_samples refuses NaN/inf (normalize={norm})")
+    dev.inst.queries.clear()
+    msg = raises(ValueError, dev.upload_arb, gap)
+    ok(msg and "2 of 64" in msg and dev.inst.raw == []
+       and not any(q.startswith("LDWF") for q in dev.inst.queries),
+       "upload_arb refuses it before LDWF?, sending nothing")
+    ok(dev.upload_arb(np.nan_to_num(gap, posinf=0.0)) == 64
+       and len(dev.inst.raw) == 1, "the same record without the gap uploads")
+
 
 # ---------------------------------------------------------------- GUI checks
 class SyncThread:
@@ -228,6 +242,29 @@ def gui_checks():
     root.update()
     ok(dlg.calls == [] and len(inst.raw) == 1,
        "generator on SINE (cell says ARB): uploads without asking")
+
+    # DS-2: take_table / pick_column refuse a NaN in the column used.
+    good = np.column_stack([np.arange(40.0), np.linspace(-1, 1, 40),
+                            np.linspace(-1, 1, 40)])
+    app.take_table(good, None, "good.csv", "good")
+    before = app.arb_samples.copy()
+    bad = good.copy()
+    bad[6, 1] = np.nan
+    dlg.expect(None)
+    app.take_table(bad, None, "gap.csv", "gap")
+    ok(len(dlg.calls) == 1 and dlg.calls[0][0] == "showerror"
+       and "data row 7" in dlg.calls[0][2]
+       and np.array_equal(app.arb_samples, before),
+       "take_table refuses a NaN in the sample column, naming row 7")
+    bad = good.copy()
+    bad[0, 2] = np.inf
+    app.take_table(bad, None, "third.csv", "third")
+    dlg.expect(None)
+    app.arb_col.set(app.arb_col_box.cget("values")[2])
+    app.pick_column()
+    ok(len(dlg.calls) == 1 and app.arb_index == 1
+       and np.all(np.isfinite(app.arb_samples)),
+       "picking the inf column is refused and column 2 kept")
 
     root.update()
     root.destroy()

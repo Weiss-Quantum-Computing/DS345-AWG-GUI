@@ -1021,6 +1021,19 @@ def default_column(names, ncols):
     return 0 if ncols == 1 else 1
 
 
+def nonfinite_rows(column):
+    """'' when every sample is a finite number, else a short note naming the
+    NaN/inf rows (counted from 1, data rows only - a header line is not one)."""
+    data = np.asarray(column, dtype=np.float64).ravel()
+    bad = np.flatnonzero(~np.isfinite(data))
+    if not bad.size:
+        return ""
+    rows = ", ".join(str(int(i) + 1) for i in bad[:8])
+    more = f" and {bad.size - 8:,} more" if bad.size > 8 else ""
+    return (f"{bad.size:,} of {data.size:,} samples are NaN or inf "
+            f"(data row {rows}{more})")
+
+
 def dac_samples(samples, normalize=True):
     """The samples exactly as the DAC will receive them, in -1..+1.
 
@@ -1031,6 +1044,15 @@ def dac_samples(samples, normalize=True):
     been rounded twice.
     """
     data = np.asarray(samples, dtype=np.float64).ravel()
+    # A NaN or inf is refused. Let through, one NaN made the normalising peak
+    # NaN and so the whole record NaN, which packs as code 0: a flat zero
+    # record uploaded with no warning. Without normalise each NaN became 0.
+    bad = np.flatnonzero(~np.isfinite(data))
+    if bad.size:
+        where = ", ".join(str(int(i)) for i in bad[:8]) + (
+            ", ..." if bad.size > 8 else "")
+        raise ValueError(f"{bad.size:,} of {data.size:,} samples are NaN or "
+                         f"inf (index {where}); nothing was sent")
     if normalize:
         peak = float(np.max(np.abs(data)))
         if peak == 0:
@@ -4017,6 +4039,18 @@ class App:
                 f"{MIN_ARB_POINTS} to store one. The pending record has been "
                 f"left as it was.")
             return
+        # A NaN or inf in the column that would be sent is refused here, where
+        # the rows can still be named. Let through, the upload path turned one
+        # NaN into a flat zero record (dac_samples now refuses it as well).
+        bad = nonfinite_rows(table[:, default_column(names, table.shape[1])])
+        if bad:
+            self.log(f"  {source}: {bad} - nothing was loaded.")
+            messagebox.showerror(
+                "Samples are not numbers",
+                f"{source}: {bad}.\n\nA waveform with a gap cannot be sent - "
+                f"it would go up as the wrong record. The pending record has "
+                f"been left as it was.")
+            return
         self.arb_table = table
         self.arb_source = source
         ncols = self.arb_table.shape[1]
@@ -4041,6 +4075,18 @@ class App:
         except ValueError:
             index = 0
         data = np.asarray(self.arb_table[:, index], dtype=np.float64).ravel()
+        bad = nonfinite_rows(data)
+        if bad:
+            keep = getattr(self, "arb_index", 0) or 0
+            self.log(f"  column {index + 1}: {bad} - keeping column {keep + 1}.")
+            messagebox.showerror(
+                "Samples are not numbers",
+                f"Column {index + 1}: {bad}.\n\nA waveform with a gap cannot "
+                f"be sent. Keeping column {keep + 1}.")
+            values = self.arb_col_box.cget("values")
+            if keep < len(values) and keep != index:
+                self.arb_col.set(values[keep])
+            return
         self.arb_samples = data
         self.arb_element = data
         self.arb_index = index
