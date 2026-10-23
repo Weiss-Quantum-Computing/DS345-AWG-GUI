@@ -39,7 +39,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 try:
     import numpy as np
@@ -303,6 +303,25 @@ class _Toolbar(NavigationToolbar2Tk if HAVE_MPL else object):
     def _stock_home(self, *args):
         super().home(*args)
 
+    # Pan and zoom tell the panel when a drag starts and ends, so the view
+    # is held only when the drag changed it (not for a click, a box under
+    # 5 px, or a press outside the axes).
+    def press_pan(self, event):
+        self._panel._mode_press()
+        super().press_pan(event)
+
+    def release_pan(self, event):
+        super().release_pan(event)
+        self._panel._mode_release()
+
+    def press_zoom(self, event):
+        self._panel._mode_press()
+        super().press_zoom(event)
+
+    def release_zoom(self, event):
+        super().release_zoom(event)
+        self._panel._mode_release()
+
 
 class PlotPanel(ttk.Frame):
     """A figure with the lab's toolbar behaviour, in one Tk frame.
@@ -341,6 +360,7 @@ class PlotPanel(ttk.Frame):
         self.hold_view = hold_view
         self.copy_coords = copy_coords
         self.view_locked = False
+        self._press_view = None
         self.dirty = True
         self.last_saved = None
 
@@ -422,13 +442,15 @@ class PlotPanel(ttk.Frame):
         the one selected (so withdrawn test windows still draw)."""
         w = self
         try:
-            parent = w.nametowidget(w.winfo_parent()) if w.winfo_parent()                 else None
+            parent = (w.nametowidget(w.winfo_parent())
+                      if w.winfo_parent() else None)
             while parent is not None:
                 if isinstance(parent, ttk.Notebook):
                     if parent.select() != str(w):
                         return False
                 w = parent
-                parent = w.nametowidget(w.winfo_parent())                     if w.winfo_parent() else None
+                parent = (w.nametowidget(w.winfo_parent())
+                          if w.winfo_parent() else None)
         except (tk.TclError, KeyError):
             return True
         return True
@@ -449,7 +471,8 @@ class PlotPanel(ttk.Frame):
             return None
         key = []
         for ax in self.fig.axes:
-            ss = ax.get_subplotspec() if hasattr(ax, "get_subplotspec")                 else None
+            ss = (ax.get_subplotspec() if hasattr(ax, "get_subplotspec")
+                  else None)
             geo = tuple(ss.get_geometry()) if ss is not None else ("free",)
             key.append(geo + (ax.get_xscale(), ax.get_yscale()))
         return tuple(key)
@@ -500,9 +523,31 @@ class PlotPanel(ttk.Frame):
 
     # -- mouse -------------------------------------------------------------
 
-    def _on_release(self, event):
-        if self._in_mode() and self.hold_view:
+    def _view_limits(self):
+        if self.fig is None:
+            return None
+        return tuple((tuple(ax.get_xlim()), tuple(ax.get_ylim()))
+                     for ax in self.fig.axes)
+
+    def _mode_press(self):
+        """A pan/zoom drag starts: note the view it starts from."""
+        self._press_view = self._view_limits()
+
+    def _mode_release(self):
+        """A pan/zoom drag ended: hold the view only if it changed."""
+        before = getattr(self, "_press_view", None)
+        self._press_view = None
+        if before is None or not self.hold_view:
+            return
+        if self._view_limits() != before:
             self._set_locked(True)
+
+    def _on_release(self, event):
+        # The toolbar's release_pan/release_zoom normally settle this; a
+        # press still pending here (a toolbar that did not call back) is
+        # settled the same way, after the toolbar's own handler has run.
+        if self._in_mode() and getattr(self, "_press_view", None) is not None:
+            self._mode_release()
 
     def _on_press(self, event):
         if event.button == 3 and self.copy_coords and \
@@ -559,7 +604,14 @@ class PlotPanel(ttk.Frame):
         return os.path.expanduser("~")
 
     def save_figure(self, path=None, dpi=SAVE_DPI):
-        """Save the figure; with `path` None, ask (the toolbar's Save)."""
+        """Save the figure; with `path` None, ask (the toolbar's Save).
+
+        Returns the path written, or None when nothing was written (no
+        figure, dialog cancelled, or the save failed).  A failure (locked
+        file, read-only folder, unknown extension) is reported beside the
+        toolbar and through `on_status`, not raised: under pythonw a Tk
+        callback has no console, so a raise would be silent.
+        """
         if self.fig is None:
             return None
         if path is None:
@@ -572,7 +624,15 @@ class PlotPanel(ttk.Frame):
                            ("SVG", "*.svg"), ("All files", "*.*")])
             if not path:
                 return None
-        self.fig.savefig(path, dpi=dpi)
+        try:
+            self.fig.savefig(path, dpi=dpi)
+        except Exception as e:
+            why = str(e) or type(e).__name__
+            self.set_status("save FAILED: %s - %s" %
+                            (os.path.basename(path), why[:60]))
+            if self.on_status is not None:
+                self.on_status("save FAILED: %s (%s)" % (path, why))
+            return None
         self.last_saved = path
         self.set_status("saved " + os.path.basename(path))
         if self.on_status is not None:
