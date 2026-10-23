@@ -4547,6 +4547,16 @@ class App:
                     self.plan_from_snapshot(settings), log=self.log)
                 for line in missed:
                     self.log(f"  {line}")
+                if missed:
+                    # As Apply reports it: otherwise a refusal is a log line
+                    # and a read-back that quietly disagrees with the file.
+                    self.root.after(0, lambda m=list(missed):
+                                    messagebox.showwarning(
+                        "Not everything took",
+                        "\n\n".join(m)
+                        + f"\n\n{os.path.basename(path)} was not recalled "
+                          "in full. The panel is about to show what the "
+                          "generator actually holds."))
                 fresh = self.awg.read_state()
                 self.log(f"Recalled {os.path.basename(path)}")
                 self.root.after(0, lambda: self.after_read(fresh,
@@ -4567,10 +4577,20 @@ class App:
         def val(key):
             return str(settings.get(key, "")).strip()
 
+        try:
+            func = FUNCS[int(float(val("FUNC")))]
+        except (ValueError, IndexError):
+            func = ""
+
         plan = {}
         if val("FUNC"):
             plan["FUNC"] = val("FUNC")
         for key in ("FSMP", "FREQ", "OFFS"):
+            # FREQ only where it means something: NOISE refuses it and an
+            # ARB's timing is FSMP (see OSCILLATING), so a NOISE/ARB
+            # snapshot sent it into a refusal on every recall.
+            if key == "FREQ" and func and func not in OSCILLATING:
+                continue
             if val(key):
                 plan[key] = val(key)
         if val("AMPL"):
@@ -4580,10 +4600,6 @@ class App:
 
         mena = val("MENA") == "1"
         mode = MODE_OF_MTYP.get(val("MTYP"), "Off") if mena else "Off"
-        try:
-            func = FUNCS[int(float(val("FUNC")))]
-        except (ValueError, IndexError):
-            func = ""
         if val("PHSE") and func in OSCILLATING and mode in ("Off", "AM",
                                                             "Burst"):
             plan["PHSE"] = val("PHSE")

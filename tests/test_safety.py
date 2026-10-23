@@ -294,6 +294,35 @@ def gui_checks():
        and np.all(np.isfinite(app.arb_samples)),
        "picking the inf column is refused and column 2 kept")
 
+    # DS-4: a NOISE/ARB snapshot recalls without FREQ; missed is shown.
+    base = dict(inst.state)
+    for code, func, want in (("4", "NOISE", False), ("5", "ARB", False),
+                             ("0", "SINE", True), ("3", "RAMP", True)):
+        plan = app.plan_from_snapshot(dict(base, FUNC=code))
+        ok(("FREQ" in plan) == want,
+           f"{func} snapshot: FREQ {'sent' if want else 'left out'} on recall")
+    import json
+    snap_path = os.path.join(tmp, "noise.json")
+    with open(snap_path, "w", encoding="utf-8") as fh:
+        json.dump(dict(app.awg.snapshot(), settings=dict(base, FUNC="4")), fh)
+    gui.filedialog.askopenfilename = lambda **kw: snap_path
+    real_apply = app.awg.apply_settings
+    sent = []
+
+    def apply_settings(plan, log=None):
+        sent.append(plan)
+        return ["AMPL 9.9VP -> execution error"]
+    app.awg.apply_settings = apply_settings
+    dlg.expect(True, None)
+    app.do_recall_setup()
+    root.update()
+    ok("FREQ" not in sent[0] and [c[0] for c in dlg.calls]
+       == ["askokcancel", "showwarning"]
+       and "AMPL 9.9VP" in dlg.calls[1][2] and "noise.json" in dlg.calls[1][2],
+       "recall of a NOISE setup sends no FREQ and shows what did not take")
+    app.awg.apply_settings = real_apply
+    ok(not app.busy, "busy cleared after the recall")
+
     # DS-3 in the panel: a typed non-DS345 address asks before connecting.
     app.awg.close()
     app.awg = gui.Ds345()
