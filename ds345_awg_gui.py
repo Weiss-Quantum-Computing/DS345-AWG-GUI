@@ -4151,15 +4151,21 @@ class App:
                          f"sample(s) clipped flat at full scale.")
         # The one arb slot is the one being played whenever the function is
         # ARB, so this upload changes the output the moment it lands - and
-        # there is no output switch to hide behind.
-        live_now = (self.vars["FUNC"].get().strip().upper() == "ARB"
-                    and self.out_state != "MUTED")
+        # there is no output switch to hide behind. ARB as the generator last
+        # reported it (inst_vals), not the Function cell: a cell switched to
+        # SINE but not applied leaves the generator playing ARB. A function
+        # not read yet counts as live.
+        func_now = str(self.inst_vals.get("FUNC", "") or "").strip().upper()
+        live_now = func_now in ("ARB", "") and self.out_state != "MUTED"
         if live_now and self.confirm_output.get():
+            said = ("The generator is playing ARB" if func_now == "ARB" else
+                    "The generator's function has not been read yet, so it "
+                    "may be playing ARB")
             if not messagebox.askokcancel(
                     "Upload to the live output?",
-                    "The function is ARB and the output is not muted, so the "
-                    "new waveform starts playing the moment it arrives - it "
-                    "replaces the one playing now.\n\nContinue?"):
+                    f"{said} and the output is not muted, so the new waveform "
+                    "starts playing the moment it arrives - it replaces the "
+                    "one playing now.\n\nContinue?"):
                 return
         self.set_busy(True)
 
@@ -4167,7 +4173,7 @@ class App:
             try:
                 n = self.awg.upload_arb(samples, normalize=norm)
                 self.log(f"Uploaded '{name}' ({n} pts) into the DS345's arb "
-                         f"slot" + ("" if live_now else
+                         f"slot" + ("" if func_now == "ARB" else
                                     " - set Function to ARB to play it"))
                 # Keep the samples so the preview can draw this waveform from
                 # now on. The generator cannot read it back out, so if we do
