@@ -2083,6 +2083,8 @@ class App:
         self.show_pending = tk.BooleanVar(value=True)
         self.out_state = None         # LIVE / MUTED / DC / None
         self.mute_restore = None      # (ampl value, ampl unit, offset) to put back
+        self.mute_restore_at = ""     # when MUTE wrote it (ISO), for the dialog
+        self.mute_restore_old = False  # True: an earlier session's, always ask
 
         # The mode row's boxes are shared by every mode, so what each one means
         # is remembered here: without it a switch of mode leaves the old values
@@ -3625,6 +3627,9 @@ class App:
                         self.log(f"  {line}")
                     if not missed:
                         self.mute_restore = restore
+                        self.mute_restore_old = False
+                        self.mute_restore_at = datetime.datetime.now(
+                            ).isoformat(timespec="seconds")
                         self.log(f"Output muted (was {restore[0]} {restore[1]}"
                                  f", offset {restore[2]} V)")
                     state = self.awg.read_state()
@@ -3647,12 +3652,23 @@ class App:
                 "cell and press Apply changes instead.")
             return
         ampl, unit, offs = restore
-        if self.confirm_output.get() and not messagebox.askokcancel(
+        # A restore saved by an earlier session always asks, whatever the
+        # tick box says: the generator being at 0 Vpp now does not mean it
+        # is still in the state MUTE left - the front panel may have been
+        # used since - and the amplitude it would put back is yesterday's.
+        old = self.mute_restore_old
+        when = (f" (muted {self.mute_restore_at})" if self.mute_restore_at
+                else "")
+        if (old or self.confirm_output.get()) and not messagebox.askokcancel(
                 "Restore the output?",
                 f"The output will go back to driving whatever is "
-                f"connected:\n\n    {self.vars['FUNC'].get().strip() or '?'}"
+                f"connected:\n\n    {self.inst_vals.get('FUNC') or '?'}"
                 f"   {ampl} {unit}   offset {offs} V\n\n"
-                "These are the settings MUTE displaced."):
+                "These are the settings MUTE displaced"
+                + (f" in an EARLIER session{when}. The front panel may have "
+                   "been used since; check the setting is still wanted."
+                   if old else "."),
+                icon="warning" if old else "question"):
             return
         self.set_busy(True)
 
@@ -3666,6 +3682,8 @@ class App:
                     self.log(f"  {line}")
                 if not missed:
                     self.mute_restore = None
+                    self.mute_restore_old = False
+                    self.mute_restore_at = ""
                     self.log(f"Output restored: {ampl} {unit}, "
                              f"offset {offs} V")
                 state = self.awg.read_state()
@@ -4776,6 +4794,8 @@ class App:
             "device_wave": self.device_wave,
             "mute_restore": list(self.mute_restore) if self.mute_restore
             else None,
+            "mute_restore_at": self.mute_restore_at if self.mute_restore
+            else None,
         }
 
     def load_config(self):
@@ -4812,13 +4832,18 @@ class App:
             self.device_wave = cfg["device_wave"]
         restore = cfg.get("mute_restore")
         if isinstance(restore, list) and len(restore) == 3:
+            # Kept, but marked as an earlier session's: the front panel may
+            # have been used since, so restoring it always asks first.
             self.mute_restore = tuple(str(v) for v in restore)
+            self.mute_restore_old = True
+            at = cfg.get("mute_restore_at")
+            self.mute_restore_at = at if isinstance(at, str) else ""
         address = cfg.get("address")
         if isinstance(address, str) and address.strip():
             # The whole point of writing the address down. It is not put in
-            # the address box: a typed address is a deliberate override that
-            # is taken at its word without checking the reply is a DS345, and
-            # a remembered one should not arrive looking like one. It is tried
+            # the address box: a typed address is a deliberate override (one
+            # that does not answer as a DS345 is only connected after asking),
+            # and a remembered one should not arrive looking like one. It is tried
             # first all the same, which is what makes the second and every
             # later session connect in a moment instead of in a minute.
             self.remembered = address.strip()

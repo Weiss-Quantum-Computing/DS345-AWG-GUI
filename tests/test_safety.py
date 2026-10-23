@@ -323,6 +323,43 @@ def gui_checks():
     app.awg.apply_settings = real_apply
     ok(not app.busy, "busy cleared after the recall")
 
+    # DS-5: a MUTE restore saved by an earlier session always asks.
+    with open(gui.CONFIG_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"mute_restore": ["5", "VP", "0"],
+                   "mute_restore_at": "2026-10-22T18:00:00"}, fh)
+    app.load_config()
+    ok(app.mute_restore == ("5", "VP", "0") and app.mute_restore_old,
+       "a restore loaded from config is marked as an earlier session's")
+    inst.state.update(AMPL="0.00VP", OFFS="0.")
+    read_all(app, root)
+    ok(app.out_state == "MUTED", "fake generator at 0 Vpp reads MUTED")
+    app.confirm_output.set(False)
+    inst.writes.clear()
+    dlg.expect(False)
+    app.flip_output()
+    root.update()
+    ok(len(dlg.calls) == 1 and "EARLIER" in dlg.calls[0][2]
+       and "2026-10-22T18:00:00" in dlg.calls[0][2] and inst.writes == [],
+       "with 'confirm' unticked the old restore still asks; Cancel writes nothing")
+    # This session's own MUTE restores without asking (box unticked).
+    inst.state.update(AMPL="1.00VP", OFFS="0.")
+    read_all(app, root)
+    app.flip_output()                      # LIVE -> MUTED, no dialog
+    root.update()
+    ok(app.out_state == "MUTED" and not app.mute_restore_old
+       and app.mute_restore[0] == "1", "MUTE in this session records 1 VP")
+    dlg.expect()
+    app.flip_output()                      # MUTED -> LIVE
+    root.update()
+    ok(dlg.calls == [] and app.out_state == "LIVE"
+       and app.mute_restore is None,
+       "this session's restore goes without asking when the box is unticked")
+    with open(gui.CONFIG_PATH, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    ok(cfg.get("mute_restore") is None and cfg.get("mute_restore_at") is None,
+       "the saved restore is cleared once used")
+    app.confirm_output.set(True)
+
     # DS-3 in the panel: a typed non-DS345 address asks before connecting.
     app.awg.close()
     app.awg = gui.Ds345()
